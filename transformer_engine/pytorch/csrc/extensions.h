@@ -731,12 +731,14 @@ void ep_dispatch(at::Tensor handle_mem, at::Tensor topk_idx, at::Tensor tokens,
 // makes it host-readable with no D2H copy, and the recv outputs are sized from it.
 // Passing tokens_scale_inv selects the MXFP8 path and also allocates + returns the
 // recv scale-inverse. Eager forbids symm-mem zero-copy IO. Returns {recv_tokens,
-// recv_topk_weights} (bf16), or {recv_tokens, recv_topk_weights, recv_scale_inv} (MXFP8).
+// recv_topk_weights}; for MXFP8 recv_tokens is the opaque payload-dtype carrier packing
+// [E4M3 data | compact scales] in its storage (see ep.py mxfp8_carrier_to_grouped).
 std::vector<at::Tensor> ep_prepare_and_dispatch_eager(
     at::Tensor handle_mem, at::Tensor topk_idx, at::Tensor tokens, at::Tensor topk_weights,
     at::Tensor tokens_per_expert, at::Tensor total_recv_tokens, int64_t top_k,
     int64_t dispatch_output_per_expert_alignment,
-    std::optional<at::Tensor> tokens_scale_inv = std::nullopt);
+    std::optional<at::Tensor> tokens_scale_inv = std::nullopt,
+    at::ScalarType payload_dtype = at::kBFloat16);
 
 void ep_combine(at::Tensor handle_mem, at::Tensor expert_out, at::Tensor result);
 

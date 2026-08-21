@@ -594,7 +594,8 @@ class _EpPrepareAndDispatchEager(torch.autograd.Function):
     """Fused eager prepare + dispatch in one C++ op, so no Python runs between the host recv-count
     read and the dispatch launch. Eager sizes and allocates the recv outputs from the host count,
     so it cannot take caller-supplied buffers. When tokens_scale_inv is set (MXFP8), tokens is the
-    quantized operand and recv is returned as a per-expert GroupedTensor. Backward is shared."""
+    quantized operand and recv is the opaque payload-dtype carrier (data + scales packed in its
+    storage, same contract as _EpDispatch). Backward is shared."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -608,6 +609,7 @@ class _EpPrepareAndDispatchEager(torch.autograd.Function):
         top_k: int,
         alignment: int,
         tokens_scale_inv: Optional[torch.Tensor] = None,
+        payload_dtype: torch.dtype = torch.bfloat16,
     ):
         """Fused prepare + dispatch fwd; recv outputs are sized from the host recv-count."""
         is_scaled = tokens_scale_inv is not None
@@ -616,7 +618,7 @@ class _EpPrepareAndDispatchEager(torch.autograd.Function):
             if tokens._fp8_dtype != tex.DType.kFloat8E4M3:
                 raise NotImplementedError("EP dispatch supports only E4M3 MXFP8 tokens for now.")
             # Reinterpret the byte-backed fp8 data so the backend sees a scaled tensor.
-            recv_tokens, recv_topk_weights, recv_scale_inv = tex.ep_prepare_and_dispatch_eager(
+            recv_tokens, recv_topk_weights = tex.ep_prepare_and_dispatch_eager(
                 handle_mem,
                 topk_idx,
                 tokens_data.view(torch.float8_e4m3fn),
@@ -626,6 +628,7 @@ class _EpPrepareAndDispatchEager(torch.autograd.Function):
                 top_k,
                 alignment,
                 tokens_scale_inv,
+                payload_dtype,
             )
         else:
             recv_tokens, recv_topk_weights = tex.ep_prepare_and_dispatch_eager(
@@ -645,16 +648,10 @@ class _EpPrepareAndDispatchEager(torch.autograd.Function):
         ctx.topk_T_flat = topk_weights.numel() // topk_weights.shape[-1]
         ctx.top_k = topk_weights.shape[-1]
         ctx.hidden_dim = tokens_data.shape[-1]
-        if is_scaled:
-            # Wrap expert-major recv data + scales into a per-expert GroupedTensor (post-launch).
-            recv_out = _make_grouped_mxfp8(
-                recv_tokens.view(tokens._rowwise_data.dtype),
-                recv_scale_inv,
-                tokens_per_expert,
-                tokens._fp8_dtype,
-                tokens.dtype,
-            )
-            return recv_out, recv_topk_weights.detach()
+        # Detach so the long-lived buffers aren't tracked as differentiable outputs; autograd
+        # re-attaches grad_fn pointing back at this Function. For scaled inputs recv_tokens is
+        # the opaque MXFP8 carrier (data + scales packed in its storage, see _EpDispatch); its
+        # grad is the plain high-precision recv grad either way.
         return recv_tokens.detach(), recv_topk_weights.detach()
 
     @staticmethod
@@ -671,6 +668,7 @@ class _EpPrepareAndDispatchEager(torch.autograd.Function):
             None,  # top_k
             None,  # alignment
             None,  # tokens_scale_inv
+            None,  # payload_dtype (sizing scalar)
         )
 
 
@@ -974,6 +972,7 @@ def ep_dispatch(
             buffer.top_k,
             buffer.alignment,
             tokens_scale_inv,
+            buffer.payload_dtype,
         )
         return recv_out, recv_topk_weights, buffer.tokens_per_expert
 

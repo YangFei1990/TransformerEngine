@@ -352,7 +352,8 @@ std::vector<at::Tensor> ep_prepare_and_dispatch_eager(at::Tensor handle_mem, at:
                                                       at::Tensor tokens_per_expert,
                                                       at::Tensor total_recv_tokens, int64_t top_k,
                                                       int64_t dispatch_output_per_expert_alignment,
-                                                      std::optional<at::Tensor> tokens_scale_inv) {
+                                                      std::optional<at::Tensor> tokens_scale_inv,
+                                                      at::ScalarType payload_dtype) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   NVTE_CHECK(tokens.dim() == 2, "eager dispatch tokens must be 2D [T, H]");
   NVTE_CHECK(total_recv_tokens.is_pinned(), "eager total_recv_tokens must be pinned host memory");
@@ -367,16 +368,29 @@ std::vector<at::Tensor> ep_prepare_and_dispatch_eager(at::Tensor handle_mem, at:
 
   // Recv outputs sized to the host count (eager forbids zero-copy, so plain allocations).
   const int64_t H = tokens.size(-1);
-  auto recv_tokens = at::empty({num_recv, H}, tokens.options());
   auto recv_topk_weights = at::empty({num_recv}, topk_weights.options());
   if (tokens_scale_inv.has_value()) {
-    // MXFP8: allocate the recv scale-inverse alongside the fp8 data and route both.
-    auto recv_scale_inv =
-        at::empty({num_recv, tokens_scale_inv->size(-1)}, tokens_scale_inv->options());
+    // MXFP8: the recv is the opaque carrier - a payload-dtype [num_recv, H] tensor whose
+    // storage packs [E4M3 data | compact scales | slack]. Carve data/scale views into it
+    // (mirrors _scale_alloc_io and the mxfp8_carrier_to_grouped unpack contract) so the
+    // dispatch writes land in carrier layout directly, and return the carrier itself.
+    const int64_t scale_cols = tokens_scale_inv->size(-1);
+    const int64_t data_bytes = num_recv * H * tokens.element_size();
+    const int64_t scale_bytes = num_recv * scale_cols * tokens_scale_inv->element_size();
+    auto carrier = at::empty({num_recv, H}, tokens.options().dtype(payload_dtype));
+    NVTE_CHECK(carrier.numel() * carrier.element_size() >= data_bytes + scale_bytes,
+               "MXFP8 carrier too small for packed data + scales");
+    auto flat = carrier.view(at::kByte).view({-1});
+    auto recv_tokens =
+        flat.narrow(0, 0, data_bytes).view(tokens.scalar_type()).view({num_recv, H});
+    auto recv_scale_inv = flat.narrow(0, data_bytes, scale_bytes)
+                              .view(tokens_scale_inv->scalar_type())
+                              .view({num_recv, scale_cols});
     ep_dispatch(handle_mem, topk_idx, tokens, topk_weights, recv_tokens, recv_topk_weights,
                 tokens_scale_inv, recv_scale_inv);
-    return {recv_tokens, recv_topk_weights, recv_scale_inv};
+    return {carrier, recv_topk_weights};
   }
+  auto recv_tokens = at::empty({num_recv, H}, tokens.options());
   ep_dispatch(handle_mem, topk_idx, tokens, topk_weights, recv_tokens, recv_topk_weights,
               std::nullopt, std::nullopt);
   return {recv_tokens, recv_topk_weights};
@@ -549,7 +563,7 @@ void register_ep_bindings(pybind11::module_& m) {
         py::arg("tokens"), py::arg("topk_weights"), py::arg("tokens_per_expert"),
         py::arg("total_recv_tokens"), py::arg("top_k"),
         py::arg("dispatch_output_per_expert_alignment"), py::arg("tokens_scale_inv") = std::nullopt,
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("payload_dtype") = at::kBFloat16, py::call_guard<py::gil_scoped_release>());
   m.def("ep_combine", &ep_combine, "EP combine", py::call_guard<py::gil_scoped_release>());
   m.def("ep_dispatch_bwd", &ep_dispatch_bwd, "EP dispatch backward",
         py::call_guard<py::gil_scoped_release>());
